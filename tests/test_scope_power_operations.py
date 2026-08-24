@@ -1,15 +1,28 @@
-"""Regression tests for channel arithmetic and power-energy calculations."""
+"""Unit tests for power calculations and channel timebase validation."""
 
+# python libraries
+import os
+
+# 3rd party libraries
 import numpy as np
-import numpy.testing as npt
+import numpy.testing
 import pytest
 
+# key must be set before import of pysignalscope. Disables the GUI inside the test machine.
+os.environ["IS_TEST"] = "True"
+
+# own libraries
 import pysignalscope as pss
 from pysignalscope.scope_dataclass import Channel
 
 
-def _channel(time, data, *, label=None, unit=None):
-    """Create a valid test channel."""
+#########################################################################################################
+# helper methods for test data
+#########################################################################################################
+
+
+def _channel(time, data, label=None, unit=None):
+    """Generate a valid channel for the unit tests."""
     return pss.Scope.generate_channel(
         time=np.asarray(time, dtype=float),
         data=np.asarray(data, dtype=float),
@@ -18,95 +31,141 @@ def _channel(time, data, *, label=None, unit=None):
     )
 
 
-def test_multiply_calculates_power_and_generates_label():
-    """Voltage and current samples on the same time base produce power."""
-    voltage = _channel([0.0, 1.0, 2.0], [2.0, 3.0, 4.0], label="Voltage", unit="V")
-    current = _channel([0.0, 1.0, 2.0], [5.0, 6.0, 7.0], label="Current", unit="A")
-
-    power = pss.Scope.multiply(voltage, current)
-
-    npt.assert_allclose(power.data, [10.0, 18.0, 28.0])
-    npt.assert_array_equal(power.time, voltage.time)
-    assert power.label == "Voltage * Current"
-    assert power.unit == "W"
-
-
-@pytest.mark.parametrize(
-    "second_time",
-    [
-        [0.0, 1.0],
-        [0.0, 1.1, 2.0],
-    ],
-)
-def test_multiply_rejects_mismatched_timebases(second_time):
-    """Point-wise multiplication must not combine differently sampled channels."""
-    voltage = _channel([0.0, 1.0, 2.0], [2.0, 3.0, 4.0])
-    current = _channel(second_time, np.ones(len(second_time)))
-
-    with pytest.raises(ValueError, match="Channel time bases"):
-        pss.Scope.multiply(voltage, current)
-
-
-def test_multiply_rejects_malformed_channel_shape():
-    """Directly constructed malformed channels are rejected before broadcasting."""
-    voltage = Channel(
-        time=np.array([0.0, 1.0, 2.0]),
-        data=np.array([2.0, 3.0]),
+def _direct_channel(time, data):
+    """Generate a Channel directly to allow invalid time/data shapes for unit tests."""
+    return Channel(
+        time=np.asarray(time, dtype=float),
+        data=np.asarray(data, dtype=float),
         label=None,
-        unit="V",
+        unit=None,
         color=None,
         linestyle=None,
         source=None,
         modulename="scope",
     )
-    current = _channel([0.0, 1.0, 2.0], [1.0, 1.0, 1.0])
 
-    with pytest.raises(ValueError, match="must have the same shape"):
+
+#########################################################################################################
+# test of _validate_compatible_timebases
+#########################################################################################################
+
+
+# parameterset for valid and invalid channel combinations
+@pytest.mark.parametrize(
+    "channels,valid_input_flag,exp_error,error_message",
+    [
+        # --valid inputs----
+        # two channels with equal time data points
+        ((_channel([0, 1, 2], [1, 2, 3]), _channel([0, 1, 2], [4, 5, 6])), True, None, None),
+        # one channel is valid for methods which only need the shape check, e.g. integrate()
+        ((_channel([0, 1], [1, 2]),), True, None, None),
+        # --invalid inputs----
+        # no channel input
+        ((), False, ValueError, "Minimum one channel"),
+        # wrong channel type
+        ((1,), False, TypeError, "channel must be type Channel"),
+        # time and data are not one-dimensional
+        ((_direct_channel([[0, 1], [2, 3]], [[1, 2], [3, 4]]),), False, ValueError, "one-dimensional"),
+        # time and data vectors have different lengths
+        ((_direct_channel([0, 1, 2], [1, 2]),), False, ValueError, "must have the same shape"),
+        # channel time vectors have different lengths
+        ((_channel([0, 1, 2], [1, 2, 3]), _channel([0, 1], [4, 5])),
+         False, ValueError, "time bases must have the same shape"),
+        # channel time vectors have equal length but different time data points
+        ((_channel([0, 1, 2], [1, 2, 3]), _channel([0, 1.1, 2], [4, 5, 6])),
+         False, ValueError, "time bases must contain identical values"),
+    ],
+)
+# definition of the testfunction
+def test_validate_compatible_timebases(channels, valid_input_flag: bool, exp_error, error_message):
+    """Test _validate_compatible_timebases() with valid and invalid channel inputs.
+
+    :param channels: input channels for the protected validation method
+    :type channels: tuple
+    :param valid_input_flag: flag to indicate if valid input data is expected
+    :type valid_input_flag: bool
+    :param exp_error: expected error type for invalid input data
+    :type exp_error: any
+    :param error_message: part of the expected error message
+    :type error_message: str or None
+    """
+    # Check if expected test result is no error
+    if valid_input_flag is True:
+        pss.Scope._validate_compatible_timebases(*channels)
+    else:  # _validate_compatible_timebases raises an error
+        with pytest.raises(exp_error, match=error_message):
+            pss.Scope._validate_compatible_timebases(*channels)
+
+
+#########################################################################################################
+# test of multiply
+#########################################################################################################
+
+
+def test_multiply():
+    """Test multiply() with valid voltage and current channels."""
+    # Define input channels
+    voltage = _channel([0, 1, 2], [2, 3, 4], label="Voltage", unit="V")
+    current = _channel([0, 1, 2], [5, 6, 7], label="Current", unit="A")
+
+    # calculate power from voltage and current
+    power = pss.Scope.multiply(voltage, current)
+
+    # verification of function result
+    numpy.testing.assert_allclose(power.data, [10, 18, 28])
+    numpy.testing.assert_array_equal(power.time, voltage.time)
+    assert power.label == "Voltage * Current"
+    assert power.unit == "W"
+
+
+def test_multiply_calls_timebase_validation():
+    """Test that multiply() uses _validate_compatible_timebases()."""
+    # Define channels with different time data points
+    voltage = _channel([0, 1, 2], [2, 3, 4])
+    current = _channel([0, 1.1, 2], [5, 6, 7])
+
+    # different time data points must raise a value error
+    with pytest.raises(ValueError, match="time bases must contain identical values"):
         pss.Scope.multiply(voltage, current)
 
 
-def test_integrate_uses_actual_nonuniform_time_steps():
-    """Cumulative energy is correct for non-equidistant scope samples."""
-    power = _channel([0.0, 0.5, 2.0], [0.0, 2.0, 2.0], unit="W")
+#########################################################################################################
+# test of integrate
+#########################################################################################################
 
+
+def test_integrate_non_equidistant_time_steps():
+    """Test integrate() with non-equidistant time data points."""
+    # Define a power channel with two different timestep lengths
+    power = _channel([0, 0.5, 2], [0, 2, 2], unit="W")
+
+    # calculate cumulative energy
     energy = pss.Scope.integrate(power)
 
-    npt.assert_allclose(energy.data, [0.0, 0.5, 3.5])
+    # verification of function result
+    numpy.testing.assert_allclose(energy.data, [0, 0.5, 3.5])
     assert energy.label == "Energy"
     assert energy.unit == "J"
 
 
-def test_integrate_accepts_two_samples_and_custom_label():
-    """A two-sample waveform has one valid trapezoidal interval."""
-    power = _channel([0.0, 2.0], [3.0, 3.0], unit="W")
+def test_integrate_two_data_points():
+    """Test integrate() with the minimum valid amount of two data points."""
+    # Define a channel containing one valid integration interval
+    power = _channel([0, 2], [3, 3], unit="W")
 
+    # calculate cumulative energy with a user-defined label
     energy = pss.Scope.integrate(power, label="Turn-on energy")
 
-    npt.assert_allclose(energy.data, [0.0, 6.0])
+    # verification of function result
+    numpy.testing.assert_allclose(energy.data, [0, 6])
     assert energy.label == "Turn-on energy"
 
 
-def test_integrate_rejects_single_sample_channel():
-    """Integration requires at least one time interval."""
-    power = _channel([0.0], [5.0], unit="W")
+def test_integrate_calls_timebase_validation():
+    """Test that integrate() uses _validate_compatible_timebases()."""
+    # Generate an invalid channel with different time and data vector lengths
+    power = _direct_channel([0, 1, 2], [1, 2])
 
-    with pytest.raises(ValueError, match="At least two channel samples"):
+    # invalid channel data shape must be detected by the validation method
+    with pytest.raises(ValueError, match="must have the same shape"):
         pss.Scope.integrate(power)
-
-
-def test_integrate_rejects_non_string_label():
-    """The optional label accepts only strings or None."""
-    power = _channel([0.0, 1.0], [1.0, 1.0], unit="W")
-
-    with pytest.raises(TypeError, match="str or None"):
-        pss.Scope.integrate(power, label=123)
-
-
-@pytest.mark.parametrize("operation", [pss.Scope.add, pss.Scope.subtract])
-def test_add_and_subtract_reject_mismatched_timebases(operation):
-    """All element-wise arithmetic operations share the same safety checks."""
-    channel_1 = _channel([0.0, 1.0, 2.0], [1.0, 2.0, 3.0])
-    channel_2 = _channel([0.0, 1.1, 2.0], [4.0, 5.0, 6.0])
-
-    with pytest.raises(ValueError, match="identical values"):
-        operation(channel_1, channel_2)

@@ -649,32 +649,44 @@ class Scope:
 
     @staticmethod
     def _validate_compatible_timebases(*channels: 'Channel') -> None:
-        """Validate channels before element-wise arithmetic operations.
+        """
+        Check channel type, data shape and time values before calculations.
 
-        Point-wise operations are only physically meaningful when every sample refers
-        to the same instant. This helper rejects malformed channels and mismatched
-        time bases instead of relying on NumPy broadcasting.
-
-        :param channels: Channels participating in an arithmetic operation
+        :param channels: Input channels
         :type channels: Channel
         """
-        if not channels:
-            raise ValueError("At least one channel is required.")
+        # check if at least one channel is provided
+        if len(channels) == 0:
+            raise ValueError("Minimum one channel input necessary!")
 
+        # check input type and channel data shape for every channel
         for channel in channels:
+            # check input type
             if not isinstance(channel, Channel):
                 raise TypeError("channel must be type Channel.")
 
-        reference_time = np.asarray(channels[0].time)
-        for channel in channels:
+            # convert time and data to numpy arrays for the following checks
             channel_time = np.asarray(channel.time)
             channel_data = np.asarray(channel.data)
+
+            # time and data must be one-dimensional vectors
             if channel_time.ndim != 1 or channel_data.ndim != 1:
                 raise ValueError("Channel.time and Channel.data must be one-dimensional.")
+
+            # each time data point must have one corresponding value data point
             if channel_time.shape != channel_data.shape:
                 raise ValueError("Channel.time and Channel.data must have the same shape.")
+
+        # use the first channel time data as reference for all following channels
+        reference_time = np.asarray(channels[0].time)
+        for channel in channels[1:]:
+            channel_time = np.asarray(channel.time)
+
+            # different vector lengths can not be calculated element by element
             if channel_time.shape != reference_time.shape:
                 raise ValueError("Channel time bases must have the same shape.")
+
+            # all channels must contain the same time data points
             if not np.array_equal(channel_time, reference_time):
                 raise ValueError("Channel time bases must contain identical values.")
 
@@ -682,9 +694,6 @@ class Scope:
     def multiply(channel_1: 'Channel', channel_2: 'Channel', label: Optional[str] = None) -> 'Channel':
         """
         Multiply two datasets, e.g. to calculate the power from voltage and current.
-
-        The channels must use identical time bases. This prevents silently
-        multiplying samples that were acquired at different instants.
 
         :param channel_1: channel_1, e.g. voltage channel
         :type channel_1: Channel
@@ -695,14 +704,22 @@ class Scope:
         :return: Multiplication of two datasets, e.g. power from voltage and current
         :rtype: Channel
         """
+        # check input type and time data points
         Scope._validate_compatible_timebases(channel_1, channel_2)
+
+        # check label for a valid type
         if label is not None and not isinstance(label, str):
             raise TypeError("label must be type str or None.")
 
+        # multiply corresponding data points of both channels
         channel_data = channel_1.data * channel_2.data
+
+        # generate a label from both input labels, if no label is provided
         if label is None and channel_1.label is not None \
                 and channel_2.label is not None:
             label = f"{channel_1.label} * {channel_2.label}"
+
+        # generate output channel containing the calculated power data
         channel_power = Channel(channel_1.time, channel_data, label=label,
                                 unit='W', color=None, linestyle=None, source=None, modulename=class_modulename)
 
@@ -714,51 +731,59 @@ class Scope:
     @staticmethod
     def integrate(channel: 'Channel', label: Optional[str] = None) -> 'Channel':
         """
-        Integrate a channel using the cumulative trapezoidal rule.
+        Integrate a channels signal.
 
-        The default use-case is calculating energy loss from a power-loss curve,
-        e.g. a double-pulse measurement. Non-equidistant sample times are handled
-        using the actual interval between each pair of samples.
+        The default use-case is calculating energy loss (variable naming is for the use case to calculate
+        switch energy from power loss curve, e.g. from double-pulse measurement)
 
         :param channel: channel with power
         :type channel: Channel
         :param label: channel label (optional parameter)
         :type label: str
-        :return: cumulative integral as a Channel
+        :return: returns a Channel-class, what integrates the input values
         :rtype: Channel
         """
-        if not isinstance(channel, Channel):
-            raise TypeError("channel_power must be type Channel.")
+        # init local variable
+        count = 0
+
+        # check input type and channel data shape
+        Scope._validate_compatible_timebases(channel)
+
+        # check label for a valid type
         if label is not None and not isinstance(label, str):
             raise TypeError("label must be type str or None.")
 
-        channel_time = np.asarray(channel.time)
-        channel_data = np.asarray(channel.data)
-        if channel_time.ndim != 1 or channel_data.ndim != 1:
-            raise ValueError("Channel.time and Channel.data must be one-dimensional.")
-        if channel_time.shape != channel_data.shape:
-            raise ValueError("Channel.time and Channel.data must have the same shape.")
-        if channel_time.size < 2:
-            raise ValueError("At least two channel samples are required for integration.")
+        # at least two data points are necessary to calculate one time interval
+        if len(channel.time) < 2:
+            raise ValueError("Minimum two channel data points necessary!")
 
-        time_steps = np.diff(channel_time)
-        if np.any(time_steps <= 0):
-            raise ValueError("Channel.time must be strictly increasing.")
+        # init result vector for the integrated energy values
+        channel_energy = np.array([])
+        for count, _ in enumerate(channel.time):
+            if count == 0:
+                # set first energy value to zero because no previous data point exists
+                channel_energy = np.append(channel_energy, 0)
+            else:
+                # calculate the individual timestep between the current and previous data point
+                # this also supports non-equidistant sampled input data
+                timestep = channel.time[count] - channel.time[count - 1]
 
-        finite_data = np.nan_to_num(channel_data)
-        trapezoids = 0.5 * (finite_data[:-1] + finite_data[1:]) * time_steps
-        channel_energy = np.concatenate(([0.0], np.cumsum(trapezoids)))
+                # reject invalid time data before calculating the integral
+                if timestep <= 0:
+                    raise ValueError("Channel.time must be strictly increasing.")
 
+                # integrate the two neighbouring data points with the trapezoidal method
+                energy = (np.nan_to_num(channel.data[count]) + np.nan_to_num(channel.data[count - 1])) / 2 * timestep
+
+                # add the current interval energy to the cumulative energy value
+                channel_energy = np.append(channel_energy, channel_energy[-1] + energy)
         if label is None:
-            logging.info(
-                f"{class_modulename} :Label was not defined. So default value is used"
-            )
+            # Log missing user input
+            logging.info(f"{class_modulename} :Label was not defined. So default value is used", class_modulename)
             label = "Energy"
 
         # Log flow control
-        logging.debug(
-            f"{class_modulename} :FlCtl Amount of channel data elements={len(channel_energy)}"
-        )
+        logging.debug(f"{class_modulename} :FlCtl Amount of channel data elements={count}")
 
         return Channel(channel.time, channel_energy, label=label, unit='J', color=None, source=None,
                        linestyle=None, modulename=class_modulename)
